@@ -1064,6 +1064,65 @@ async function handleSessionInitInner(
     }
 
     if (teamId && teamId !== BYPASS_MARKER) {
+      // 递进 auto-select（对齐上方 teams.length===1 路径）：多 team 里选完 team 后，
+      // 该 team 只有 1 个 agent 时拆 stage 客户端（codex/WB/dsh）直接跳过 agent
+      // form —— 否则 dsh form 的 agent stage ≥2 断言会 throw，session-init 失败。
+      const pickedTeam = (state.cachedTeams ?? []).find((t) => t.team_id === teamId);
+      const splitStage = isCodexClient || agentSource === "workbuddy" || agentSource === "dsh";
+      if (splitStage && pickedTeam && pickedTeam.agents.length === 1) {
+        const soloAgent = pickedTeam.agents[0];
+        const nextState: SessionInitState = {
+          ...state,
+          status: "pending_agent_select" as any,
+          attemptCount: 0,
+          selectedTeamId: teamId,
+          selectedAgentId: soloAgent.agent_id,
+        };
+        console.log(
+          `[session-init:cb] session=${compositeKey} team=${teamId} only-agent=${soloAgent.agent_id} auto-select`,
+        );
+        // 0 tasks → bypass；1 task → 直接 completeRegistration；≥2 → 出 task form。
+        if (pickedTeam.tasks.length === 0) {
+          await store.set(compositeKey, {
+            ...nextState,
+            status: "initialized",
+            sessionInfo: null,
+            agentDetail: null,
+            taskDetail: null,
+            bypassed: true,
+          } as SessionInitState);
+          console.log(
+            `[session-init:cb] session=${compositeKey} team has 0 tasks → bypass`,
+          );
+          return { intercepted: false, bypassed: true, justRegistered: true };
+        }
+        if (pickedTeam.tasks.length === 1) {
+          const soleTaskId = pickedTeam.tasks[0].task_id;
+          console.log(
+            `[session-init:cb] session=${compositeKey} auto-select single task=${soleTaskId} → completeRegistration`,
+          );
+          return await completeRegistration(
+            { agent_id: soloAgent.agent_id, task_id: soleTaskId },
+            nextState, state.cachedTeams ?? [], compositeKey, sessionKey, userId,
+            config, store, messages, metadataClient, userKey, spaceId,
+          );
+        }
+        await store.set(compositeKey, { ...nextState, status: "pending_task_select" });
+        console.log(
+          `[session-init:cb] session=${compositeKey} → pending_task_select (tasks=${pickedTeam.tasks.length})`,
+        );
+        const fd: FormData = {
+          teams: state.cachedTeams ?? [],
+          stage: "task_select",
+          selectedTeamId: teamId,
+          selectedAgentId: soloAgent.agent_id,
+          stream: reqCtx.stream,
+          modelId: reqCtx.modelId,
+          protocol: reqCtx.protocol,
+        };
+        return { intercepted: true, response: buildFormResponse(fd), formData: fd };
+      }
+
       // codex/WB 拆 stage：先 agent_select → task_select；CB 老路径继续 agent_task 一发同时问。
       const nextStatus = (isCodexClient || agentSource === "workbuddy" || agentSource === "dsh") ? "pending_agent_select" : "pending_agent_task";
       const nextStage: FormData["stage"] = (isCodexClient || agentSource === "workbuddy" || agentSource === "dsh") ? "agent_select" : "agent_task";
